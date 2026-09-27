@@ -1,8 +1,14 @@
 #define WIN32_LEAN_AND_MEAN
+#ifdef PAGEHOTKEYS_RPI_UDP
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#ifndef PAGEHOTKEYS_SUMATRA_CLI_DDE
 #include <ddeml.h>
+#endif
 #include <shellapi.h>
 
 #include <string.h>
@@ -37,20 +43,65 @@ constexpr int kIdExit = 107;
 constexpr int kIdStatus = 108;
 constexpr int kIdConsumeKey = 109;
 constexpr int kIdInfoCredit = 110;
+constexpr int kIdScrollLinesEdit = 111;
+constexpr int kIdScrollLinesSpin = 112;
+#ifdef PAGEHOTKEYS_RPI_UDP
+constexpr int kIdRpiEnable = 113;
+constexpr int kIdRpiPortEdit = 114;
+constexpr int kIdRpiTokenEdit = 115;
+constexpr int kIdRpiStatus = 116;
+#endif
 
 constexpr int kIdHotkeyBase = 200;
 constexpr int kIdEnableBase = 300;
 constexpr UINT kTrayCallbackMessage = WM_APP + 1;
 constexpr UINT kTrayIconId = 1;
+#ifdef PAGEHOTKEYS_RPI_UDP
+constexpr UINT kRpiControllerMessage = WM_APP + 2;
+#endif
 
 constexpr size_t kMaxPathChars = 4096;
 constexpr size_t kMaxEnvironmentChars = 32767;
 constexpr size_t kMaxStatusChars = 512;
+constexpr size_t kMaxDdeExecuteChars = 32768;
+#ifdef PAGEHOTKEYS_RPI_UDP
+constexpr size_t kMaxRpiTokenChars = 64;
+constexpr int kDefaultRpiPort = 28750;
+constexpr int kMinRpiPort = 1;
+constexpr int kMaxRpiPort = 65535;
+#endif
+constexpr int kDefaultScrollLines = 5;
+constexpr int kMinScrollLines = 1;
+constexpr int kMaxScrollLines = 999;
+#ifndef PAGEHOTKEYS_SUMATRA_CLI_DDE
 constexpr DWORD kDdeTimeoutMs = 5000;
+#endif
+
+#ifdef PAGEHOTKEYS_PUBLIC_BUILD
+constexpr bool kPublicBuild = true;
+#else
+constexpr bool kPublicBuild = false;
+#endif
+
+#ifdef PAGEHOTKEYS_RPI_UDP
+constexpr int kMainWindowHeight = 552;
+constexpr int kActionButtonY = 408;
+constexpr int kStatusY = 460;
+#else
+constexpr int kMainWindowHeight = 458;
+constexpr int kActionButtonY = 314;
+constexpr int kStatusY = 366;
+#endif
 
 struct Config {
     wchar_t sumatraPath[kMaxPathChars];
     bool usePathSearch;
+    int scrollLines;
+#ifdef PAGEHOTKEYS_RPI_UDP
+    bool rpiEnabled;
+    int rpiPort;
+    wchar_t rpiToken[kMaxRpiTokenChars];
+#endif
 };
 
 struct HotkeyAction {
@@ -80,9 +131,27 @@ struct RegistrationCounts {
     bool rawFallback;
 };
 
+#ifdef PAGEHOTKEYS_RPI_UDP
+struct RpiThreadConfig {
+    int port;
+    char token[kMaxRpiTokenChars];
+};
+#endif
+
 HINSTANCE g_instance = nullptr;
 HWND g_mainWindow = nullptr;
 HWND g_sumatraEdit = nullptr;
+HWND g_scrollLinesEdit = nullptr;
+HWND g_scrollLinesSpin = nullptr;
+#ifdef PAGEHOTKEYS_RPI_UDP
+HWND g_rpiEnableCheckbox = nullptr;
+HWND g_rpiPortEdit = nullptr;
+HWND g_rpiTokenEdit = nullptr;
+HWND g_rpiStatus = nullptr;
+HANDLE g_rpiThread = nullptr;
+HANDLE g_rpiStopEvent = nullptr;
+SOCKET g_rpiSocket = INVALID_SOCKET;
+#endif
 HWND g_status = nullptr;
 HWND g_consumeKeyCheckbox = nullptr;
 HFONT g_font = nullptr;
@@ -112,12 +181,12 @@ constexpr WORD MakeHotkey(WORD vk, WORD flags) {
 HotkeyAction g_actions[] = {
     {kActionScrollUp, kIdHotkeyBase + 3, kIdEnableBase + 3,
      L"Scroll up", L"ScrollUpHotkey", L"ScrollUpEnabled",
-     L"CmdScrollUpPage", false,
+     L"CmdScrollUp", false,
      MakeHotkey(VK_SUBTRACT, 0), 0,
      true, false, nullptr, nullptr, false, false},
     {kActionScrollDown, kIdHotkeyBase + 2, kIdEnableBase + 2,
      L"Scroll down", L"ScrollDownHotkey", L"ScrollDownEnabled",
-     L"CmdScrollDownPage", false,
+     L"CmdScrollDown", false,
      MakeHotkey(VK_ADD, 0), 0,
      true, false, nullptr, nullptr, false, false},
     {kActionPrevPage, kIdHotkeyBase + 1, kIdEnableBase + 1,
@@ -324,6 +393,99 @@ HWND CreateChild(const wchar_t* className,
     return control;
 }
 
+int ClampScrollLines(int value) {
+    if (value < kMinScrollLines) {
+        return kMinScrollLines;
+    }
+    if (value > kMaxScrollLines) {
+        return kMaxScrollLines;
+    }
+    return value;
+}
+
+void SetScrollLinesUi(int value) {
+    if (g_scrollLinesEdit != nullptr) {
+        SetDlgItemInt(g_mainWindow, kIdScrollLinesEdit, static_cast<UINT>(value), FALSE);
+    }
+    if (g_scrollLinesSpin != nullptr) {
+        SendMessageW(g_scrollLinesSpin, UDM_SETPOS32, 0, value);
+    }
+}
+
+void ReadScrollLinesUi(bool normalize) {
+    if (g_scrollLinesEdit == nullptr) {
+        return;
+    }
+
+    BOOL translated = FALSE;
+    const UINT value = GetDlgItemInt(g_mainWindow, kIdScrollLinesEdit, &translated, FALSE);
+    if (translated) {
+        g_config.scrollLines = ClampScrollLines(static_cast<int>(value));
+    }
+
+    if (normalize) {
+        SetScrollLinesUi(g_config.scrollLines);
+    }
+}
+
+#ifdef PAGEHOTKEYS_RPI_UDP
+int ClampRpiPort(int value) {
+    if (value < kMinRpiPort) {
+        return kMinRpiPort;
+    }
+    if (value > kMaxRpiPort) {
+        return kMaxRpiPort;
+    }
+    return value;
+}
+
+void SetRpiStatus(const wchar_t* text) {
+    if (g_rpiStatus != nullptr) {
+        SetWindowTextW(g_rpiStatus, text);
+    }
+}
+
+void SetRpiUiFromConfig() {
+    if (g_rpiEnableCheckbox != nullptr) {
+        CheckDlgButton(
+            g_mainWindow,
+            kIdRpiEnable,
+            g_config.rpiEnabled ? BST_CHECKED : BST_UNCHECKED);
+    }
+    if (g_rpiPortEdit != nullptr) {
+        SetDlgItemInt(g_mainWindow, kIdRpiPortEdit, static_cast<UINT>(g_config.rpiPort), FALSE);
+    }
+    if (g_rpiTokenEdit != nullptr) {
+        SetWindowTextW(g_rpiTokenEdit, g_config.rpiToken);
+    }
+}
+
+void ReadRpiUiToConfig(bool normalize) {
+    if (g_rpiEnableCheckbox != nullptr) {
+        g_config.rpiEnabled = IsDlgButtonChecked(g_mainWindow, kIdRpiEnable) == BST_CHECKED;
+    }
+
+    if (g_rpiPortEdit != nullptr) {
+        BOOL translated = FALSE;
+        const UINT value = GetDlgItemInt(g_mainWindow, kIdRpiPortEdit, &translated, FALSE);
+        if (translated) {
+            g_config.rpiPort = ClampRpiPort(static_cast<int>(value));
+        }
+        if (normalize) {
+            SetDlgItemInt(g_mainWindow, kIdRpiPortEdit, static_cast<UINT>(g_config.rpiPort), FALSE);
+        }
+    }
+
+    if (g_rpiTokenEdit != nullptr) {
+        GetWindowTextW(g_rpiTokenEdit, g_config.rpiToken, static_cast<int>(CountOf(g_config.rpiToken)));
+        TrimInPlace(g_config.rpiToken);
+        if (normalize) {
+            SetWindowTextW(g_rpiTokenEdit, g_config.rpiToken);
+        }
+    }
+}
+#endif
+
 bool BuildConfigPath() {
     wchar_t modulePath[kMaxPathChars] = {};
     const DWORD length = GetModuleFileNameW(nullptr, modulePath, static_cast<DWORD>(CountOf(modulePath)));
@@ -480,7 +642,13 @@ bool DiscoverSumatraPath(wchar_t* destination, size_t capacity, bool allowExecut
 void LoadConfig() {
     g_config.sumatraPath[0] = L'\0';
     g_config.usePathSearch = true;
-    g_consumeKey = false;
+    g_config.scrollLines = kDefaultScrollLines;
+#ifdef PAGEHOTKEYS_RPI_UDP
+    g_config.rpiEnabled = false;
+    g_config.rpiPort = kDefaultRpiPort;
+    CopyString(g_config.rpiToken, CountOf(g_config.rpiToken), L"wojtron");
+#endif
+    g_consumeKey = kPublicBuild;
 
     for (size_t i = 0; i < CountOf(g_actions); ++i) {
         g_actions[i].hotkey = g_actions[i].defaultHotkey;
@@ -519,11 +687,42 @@ void LoadConfig() {
         DiscoverSumatraPath(g_config.sumatraPath, CountOf(g_config.sumatraPath), true);
     }
 
-    g_consumeKey = GetPrivateProfileIntW(
+    if (kPublicBuild) {
+        g_consumeKey = true;
+    } else {
+        g_consumeKey = GetPrivateProfileIntW(
+            L"Hotkeys",
+            L"ConsumeKey",
+            0,
+            g_configPath) != 0;
+    }
+
+    g_config.scrollLines = ClampScrollLines(GetPrivateProfileIntW(
         L"Hotkeys",
-        L"ConsumeKey",
+        L"ScrollLines",
+        kDefaultScrollLines,
+        g_configPath));
+
+#ifdef PAGEHOTKEYS_RPI_UDP
+    g_config.rpiEnabled = GetPrivateProfileIntW(
+        L"RPi",
+        L"Enabled",
         0,
         g_configPath) != 0;
+    g_config.rpiPort = ClampRpiPort(GetPrivateProfileIntW(
+        L"RPi",
+        L"Port",
+        kDefaultRpiPort,
+        g_configPath));
+    GetPrivateProfileStringW(
+        L"RPi",
+        L"Token",
+        L"wojtron",
+        g_config.rpiToken,
+        static_cast<DWORD>(CountOf(g_config.rpiToken)),
+        g_configPath);
+    TrimInPlace(g_config.rpiToken);
+#endif
 
     for (size_t i = 0; i < CountOf(g_actions); ++i) {
         const UINT value = GetPrivateProfileIntW(
@@ -563,6 +762,46 @@ bool SaveConfig() {
         return false;
     }
 
+    wchar_t scrollLinesValue[32] = {};
+    wsprintfW(scrollLinesValue, L"%u", static_cast<unsigned int>(g_config.scrollLines));
+    if (!WritePrivateProfileStringW(
+            L"Hotkeys",
+            L"ScrollLines",
+            scrollLinesValue,
+            g_configPath)) {
+        return false;
+    }
+
+#ifdef PAGEHOTKEYS_RPI_UDP
+    wchar_t rpiEnabledValue[32] = {};
+    wsprintfW(rpiEnabledValue, L"%u", g_config.rpiEnabled ? 1u : 0u);
+    if (!WritePrivateProfileStringW(
+            L"RPi",
+            L"Enabled",
+            rpiEnabledValue,
+            g_configPath)) {
+        return false;
+    }
+
+    wchar_t rpiPortValue[32] = {};
+    wsprintfW(rpiPortValue, L"%u", static_cast<unsigned int>(g_config.rpiPort));
+    if (!WritePrivateProfileStringW(
+            L"RPi",
+            L"Port",
+            rpiPortValue,
+            g_configPath)) {
+        return false;
+    }
+
+    if (!WritePrivateProfileStringW(
+            L"RPi",
+            L"Token",
+            g_config.rpiToken,
+            g_configPath)) {
+        return false;
+    }
+#endif
+
     for (size_t i = 0; i < CountOf(g_actions); ++i) {
         wchar_t value[32] = {};
         wsprintfW(value, L"%u", static_cast<unsigned int>(g_actions[i].hotkey));
@@ -601,6 +840,11 @@ void SetUiFromConfig() {
             g_consumeKey ? BST_CHECKED : BST_UNCHECKED);
     }
 
+    SetScrollLinesUi(g_config.scrollLines);
+#ifdef PAGEHOTKEYS_RPI_UDP
+    SetRpiUiFromConfig();
+#endif
+
     for (size_t i = 0; i < CountOf(g_actions); ++i) {
         if (g_actions[i].control != nullptr) {
             SendMessageW(g_actions[i].control, HKM_SETHOTKEY, g_actions[i].hotkey, 0);
@@ -625,7 +869,14 @@ void ReadUiToConfig() {
 
     if (g_consumeKeyCheckbox != nullptr) {
         g_consumeKey = IsDlgButtonChecked(g_mainWindow, kIdConsumeKey) == BST_CHECKED;
+    } else if (kPublicBuild) {
+        g_consumeKey = true;
     }
+
+    ReadScrollLinesUi(true);
+#ifdef PAGEHOTKEYS_RPI_UDP
+    ReadRpiUiToConfig(true);
+#endif
 
     for (size_t i = 0; i < CountOf(g_actions); ++i) {
         if (g_actions[i].control != nullptr) {
@@ -744,6 +995,7 @@ void ResetRawPressedStates() {
     g_rawShiftDown = false;
 }
 
+#ifndef PAGEHOTKEYS_PUBLIC_BUILD
 bool RegisterRawInputListener() {
     if (g_rawInputRegistered) {
         return true;
@@ -780,6 +1032,7 @@ void UnregisterRawInputListener() {
     g_rawInputRegistered = false;
     ResetRawPressedStates();
 }
+#endif
 
 void UnregisterAllHotkeys() {
     for (size_t i = 0; i < CountOf(g_actions); ++i) {
@@ -788,7 +1041,9 @@ void UnregisterAllHotkeys() {
             g_actions[i].registered = false;
         }
     }
+#ifndef PAGEHOTKEYS_PUBLIC_BUILD
     UnregisterRawInputListener();
+#endif
 }
 
 RegistrationCounts RegisterAllHotkeys() {
@@ -834,6 +1089,7 @@ RegistrationCounts RegisterAllHotkeys() {
         }
     }
 
+#ifndef PAGEHOTKEYS_PUBLIC_BUILD
     if (!g_consumeKey || (counts.commandConfigured > 0 && counts.commandRegistered == 0 && counts.failed > 0)) {
         bool anyConfigured = false;
         for (size_t i = 0; i < CountOf(g_actions); ++i) {
@@ -853,10 +1109,12 @@ RegistrationCounts RegisterAllHotkeys() {
             }
         }
     }
+#endif
 
     return counts;
 }
 
+#ifndef PAGEHOTKEYS_SUMATRA_CLI_DDE
 const wchar_t* DdeErrorText(UINT error) {
     switch (error) {
         case DMLERR_NO_ERROR: return L"no error";
@@ -901,12 +1159,10 @@ HDDEDATA CALLBACK DdeCallback(UINT type,
     return nullptr;
 }
 
-bool BuildDdeExecuteString(const wchar_t* ddeCommand, char* destination, size_t capacity) {
+bool BuildDdeExecuteString(const wchar_t* ddeExecute, char* destination, size_t capacity) {
     destination[0] = '\0';
     size_t length = 0;
-    return AppendAnsiChar(destination, capacity, &length, '[') &&
-           AppendWideAsAnsi(destination, capacity, &length, ddeCommand) &&
-           AppendAnsiChar(destination, capacity, &length, ']');
+    return AppendWideAsAnsi(destination, capacity, &length, ddeExecute);
 }
 
 void SetStatusWithDdeError(const wchar_t* prefix, UINT error) {
@@ -915,9 +1171,9 @@ void SetStatusWithDdeError(const wchar_t* prefix, UINT error) {
     SetStatus(status);
 }
 
-bool RunSumatraDdeCommand(const wchar_t* ddeCommand) {
-    char executeString[128] = {};
-    if (!BuildDdeExecuteString(ddeCommand, executeString, CountOf(executeString))) {
+bool RunSumatraDdeExecute(const wchar_t* ddeExecute) {
+    char executeString[kMaxDdeExecuteChars] = {};
+    if (!BuildDdeExecuteString(ddeExecute, executeString, CountOf(executeString))) {
         SetStatus(L"DDE command is too long.");
         return false;
     }
@@ -985,7 +1241,375 @@ cleanup:
     DdeUninitialize(ddeInstance);
     return ok;
 }
+#else
+bool BuildSumatraDdeParameters(const wchar_t* ddeExecute, wchar_t* destination, size_t capacity) {
+    destination[0] = L'\0';
+    size_t length = 0;
+    return AppendString(destination, capacity, &length, L"-dde \"") &&
+           AppendString(destination, capacity, &length, ddeExecute) &&
+           AppendString(destination, capacity, &length, L"\"");
+}
 
+void SetStatusWithShellExecuteError(const wchar_t* prefix, INT_PTR error) {
+    wchar_t status[kMaxStatusChars] = {};
+    wsprintfW(status, L"%ls ShellExecute error %ld.", prefix, static_cast<long>(error));
+    SetStatus(status);
+}
+
+bool RunSumatraDdeExecute(const wchar_t* ddeExecute) {
+    wchar_t parameters[kMaxDdeExecuteChars] = {};
+    if (!BuildSumatraDdeParameters(ddeExecute, parameters, CountOf(parameters))) {
+        SetStatus(L"DDE command is too long.");
+        return false;
+    }
+
+    const wchar_t* executable = g_config.sumatraPath[0] != L'\0'
+        ? g_config.sumatraPath
+        : L"SumatraPDF.exe";
+    const HINSTANCE result = ShellExecuteW(
+        nullptr,
+        L"open",
+        executable,
+        parameters,
+        nullptr,
+        SW_HIDE);
+    const INT_PTR resultCode = reinterpret_cast<INT_PTR>(result);
+    if (resultCode <= 32) {
+        SetStatusWithShellExecuteError(L"Could not run SumatraPDF -dde.", resultCode);
+        return false;
+    }
+
+    return true;
+}
+#endif
+
+#ifdef PAGEHOTKEYS_RPI_UDP
+bool AsciiEqualsIgnoreCase(const char* left, const char* right) {
+    size_t i = 0;
+    while (left[i] != '\0' && right[i] != '\0') {
+        char a = left[i];
+        char b = right[i];
+        if (a >= 'a' && a <= 'z') {
+            a = static_cast<char>(a - 'a' + 'A');
+        }
+        if (b >= 'a' && b <= 'z') {
+            b = static_cast<char>(b - 'a' + 'A');
+        }
+        if (a != b) {
+            return false;
+        }
+        ++i;
+    }
+
+    return left[i] == '\0' && right[i] == '\0';
+}
+
+void SanitizeRpiPacket(char* text, int length) {
+    for (int i = 0; i < length; ++i) {
+        const char ch = text[i];
+        if (ch == '\r' || ch == '\n' || ch == '\t' ||
+            ch == ':' || ch == ',' || ch == ';' || ch == '|' || ch == '=') {
+            text[i] = ' ';
+        } else if (static_cast<unsigned char>(ch) < 32) {
+            text[i] = ' ';
+        }
+    }
+    text[length] = '\0';
+}
+
+bool ReadAsciiToken(const char** cursor, char* token, size_t capacity) {
+    while (**cursor == ' ') {
+        ++(*cursor);
+    }
+
+    if (**cursor == '\0' || capacity == 0) {
+        return false;
+    }
+
+    size_t length = 0;
+    while (**cursor != '\0' && **cursor != ' ') {
+        if (length + 1 >= capacity) {
+            return false;
+        }
+        token[length] = **cursor;
+        ++length;
+        ++(*cursor);
+    }
+    token[length] = '\0';
+    return true;
+}
+
+int RpiCommandToActionId(const char* command) {
+    if (AsciiEqualsIgnoreCase(command, "UP") ||
+        AsciiEqualsIgnoreCase(command, "U") ||
+        AsciiEqualsIgnoreCase(command, "SCROLL_UP") ||
+        AsciiEqualsIgnoreCase(command, "SCROLLUP")) {
+        return kActionScrollUp;
+    }
+
+    if (AsciiEqualsIgnoreCase(command, "DOWN") ||
+        AsciiEqualsIgnoreCase(command, "D") ||
+        AsciiEqualsIgnoreCase(command, "SCROLL_DOWN") ||
+        AsciiEqualsIgnoreCase(command, "SCROLLDOWN")) {
+        return kActionScrollDown;
+    }
+
+    if (AsciiEqualsIgnoreCase(command, "PREV") ||
+        AsciiEqualsIgnoreCase(command, "PREVIOUS") ||
+        AsciiEqualsIgnoreCase(command, "PREV_PAGE") ||
+        AsciiEqualsIgnoreCase(command, "PAGE_UP") ||
+        AsciiEqualsIgnoreCase(command, "PAGEUP")) {
+        return kActionPrevPage;
+    }
+
+    if (AsciiEqualsIgnoreCase(command, "NEXT") ||
+        AsciiEqualsIgnoreCase(command, "NEXT_PAGE") ||
+        AsciiEqualsIgnoreCase(command, "PAGE_DOWN") ||
+        AsciiEqualsIgnoreCase(command, "PAGEDOWN")) {
+        return kActionNextPage;
+    }
+
+    return 0;
+}
+
+int ParseRpiPacket(const char* packet, int length, const char* expectedToken) {
+    char buffer[128] = {};
+    if (length <= 0) {
+        return 0;
+    }
+    if (length >= static_cast<int>(CountOf(buffer))) {
+        length = static_cast<int>(CountOf(buffer)) - 1;
+    }
+
+    for (int i = 0; i < length; ++i) {
+        buffer[i] = packet[i];
+    }
+    SanitizeRpiPacket(buffer, length);
+
+    const char* cursor = buffer;
+    char first[64] = {};
+    char second[64] = {};
+    if (!ReadAsciiToken(&cursor, first, CountOf(first))) {
+        return 0;
+    }
+
+    if (expectedToken != nullptr && expectedToken[0] != '\0') {
+        if (!AsciiEqualsIgnoreCase(first, expectedToken)) {
+            return 0;
+        }
+        if (!ReadAsciiToken(&cursor, second, CountOf(second))) {
+            return 0;
+        }
+        return RpiCommandToActionId(second);
+    }
+
+    return RpiCommandToActionId(first);
+}
+
+void PostRpiEvent(WPARAM event, LPARAM value) {
+    if (g_mainWindow != nullptr) {
+        PostMessageW(g_mainWindow, kRpiControllerMessage, event, value);
+    }
+}
+
+DWORD WINAPI RpiUdpThreadProc(void* parameter) {
+    RpiThreadConfig* config = static_cast<RpiThreadConfig*>(parameter);
+    if (config == nullptr) {
+        return 1;
+    }
+
+    WSADATA wsaData = {};
+    int error = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (error != 0) {
+        PostRpiEvent(1003, error);
+        HeapFree(GetProcessHeap(), 0, config);
+        return 1;
+    }
+
+    SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udpSocket == INVALID_SOCKET) {
+        PostRpiEvent(1003, WSAGetLastError());
+        WSACleanup();
+        HeapFree(GetProcessHeap(), 0, config);
+        return 1;
+    }
+
+    g_rpiSocket = udpSocket;
+
+    int timeoutMs = 250;
+    setsockopt(
+        udpSocket,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&timeoutMs),
+        sizeof(timeoutMs));
+
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons(static_cast<unsigned short>(config->port));
+
+    if (bind(udpSocket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {
+        PostRpiEvent(1003, WSAGetLastError());
+        closesocket(udpSocket);
+        g_rpiSocket = INVALID_SOCKET;
+        WSACleanup();
+        HeapFree(GetProcessHeap(), 0, config);
+        return 1;
+    }
+
+    PostRpiEvent(1001, config->port);
+
+    char packet[128] = {};
+    while (WaitForSingleObject(g_rpiStopEvent, 0) == WAIT_TIMEOUT) {
+        sockaddr_in sender = {};
+        int senderSize = sizeof(sender);
+        const int received = recvfrom(
+            udpSocket,
+            packet,
+            static_cast<int>(CountOf(packet)) - 1,
+            0,
+            reinterpret_cast<sockaddr*>(&sender),
+            &senderSize);
+
+        if (received == SOCKET_ERROR) {
+            const int receiveError = WSAGetLastError();
+            if (receiveError == WSAETIMEDOUT || receiveError == WSAEWOULDBLOCK) {
+                continue;
+            }
+            if (WaitForSingleObject(g_rpiStopEvent, 0) == WAIT_TIMEOUT) {
+                PostRpiEvent(1003, receiveError);
+            }
+            break;
+        }
+
+        const int actionId = ParseRpiPacket(packet, received, config->token);
+        if (actionId != 0) {
+            PostRpiEvent(static_cast<WPARAM>(actionId), 0);
+        }
+    }
+
+    closesocket(udpSocket);
+    g_rpiSocket = INVALID_SOCKET;
+    WSACleanup();
+    HeapFree(GetProcessHeap(), 0, config);
+    PostRpiEvent(1002, 0);
+    return 0;
+}
+
+bool CopyRpiTokenAsAnsi(char* destination, size_t capacity) {
+    destination[0] = '\0';
+    size_t length = 0;
+    return AppendWideAsAnsi(destination, capacity, &length, g_config.rpiToken);
+}
+
+void StopRpiController() {
+    if (g_rpiThread == nullptr) {
+        SetRpiStatus(L"RPi UDP: disabled");
+        return;
+    }
+
+    if (g_rpiStopEvent != nullptr) {
+        SetEvent(g_rpiStopEvent);
+    }
+
+    WaitForSingleObject(g_rpiThread, 2000);
+    CloseHandle(g_rpiThread);
+    g_rpiThread = nullptr;
+
+    if (g_rpiStopEvent != nullptr) {
+        CloseHandle(g_rpiStopEvent);
+        g_rpiStopEvent = nullptr;
+    }
+
+    SetRpiStatus(L"RPi UDP: disabled");
+}
+
+bool StartRpiController() {
+    StopRpiController();
+
+    if (!g_config.rpiEnabled) {
+        SetRpiStatus(L"RPi UDP: disabled");
+        return true;
+    }
+
+    RpiThreadConfig* threadConfig = static_cast<RpiThreadConfig*>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(RpiThreadConfig)));
+    if (threadConfig == nullptr) {
+        SetRpiStatus(L"RPi UDP: could not allocate config");
+        return false;
+    }
+
+    threadConfig->port = ClampRpiPort(g_config.rpiPort);
+    if (!CopyRpiTokenAsAnsi(threadConfig->token, CountOf(threadConfig->token))) {
+        HeapFree(GetProcessHeap(), 0, threadConfig);
+        SetRpiStatus(L"RPi UDP: token must be ASCII");
+        return false;
+    }
+
+    g_rpiStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_rpiStopEvent == nullptr) {
+        HeapFree(GetProcessHeap(), 0, threadConfig);
+        SetRpiStatus(L"RPi UDP: could not create stop event");
+        return false;
+    }
+
+    g_rpiThread = CreateThread(nullptr, 0, RpiUdpThreadProc, threadConfig, 0, nullptr);
+    if (g_rpiThread == nullptr) {
+        CloseHandle(g_rpiStopEvent);
+        g_rpiStopEvent = nullptr;
+        HeapFree(GetProcessHeap(), 0, threadConfig);
+        SetRpiStatus(L"RPi UDP: could not start thread");
+        return false;
+    }
+
+    SetRpiStatus(L"RPi UDP: starting...");
+    return true;
+}
+#endif
+
+bool IsScrollAction(const HotkeyAction* action) {
+    return action != nullptr &&
+           (action->id == kActionScrollUp || action->id == kActionScrollDown);
+}
+
+bool AppendDdeNamedCommand(wchar_t* destination,
+                           size_t capacity,
+                           size_t* length,
+                           const wchar_t* command) {
+    return AppendChar(destination, capacity, length, L'[') &&
+           AppendString(destination, capacity, length, command) &&
+           AppendChar(destination, capacity, length, L']');
+}
+
+bool BuildActionDdeExecute(const HotkeyAction* action, wchar_t* destination, size_t capacity) {
+    if (destination == nullptr || capacity == 0) {
+        return false;
+    }
+
+    destination[0] = L'\0';
+    if (action == nullptr || action->ddeCommand == nullptr) {
+        return false;
+    }
+
+    int repeatCount = 1;
+    if (IsScrollAction(action)) {
+        ReadScrollLinesUi(false);
+        g_config.scrollLines = ClampScrollLines(g_config.scrollLines);
+        repeatCount = g_config.scrollLines;
+    }
+
+    size_t length = 0;
+    for (int i = 0; i < repeatCount; ++i) {
+        if (!AppendDdeNamedCommand(destination, capacity, &length, action->ddeCommand)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+#ifndef PAGEHOTKEYS_PUBLIC_BUILD
 bool IsModifierVk(BYTE vk) {
     return vk == VK_SHIFT ||
            vk == VK_LSHIFT ||
@@ -1026,6 +1650,7 @@ void ResetRawPressedForVk(BYTE vk) {
         }
     }
 }
+#endif
 
 void FireAction(HotkeyAction* action) {
     if (action == nullptr) {
@@ -1037,13 +1662,20 @@ void FireAction(HotkeyAction* action) {
         return;
     }
 
-    if (action->ddeCommand != nullptr && RunSumatraDdeCommand(action->ddeCommand)) {
+    wchar_t ddeExecute[kMaxDdeExecuteChars] = {};
+    if (!BuildActionDdeExecute(action, ddeExecute, CountOf(ddeExecute))) {
+        SetStatus(L"DDE command is too long.");
+        return;
+    }
+
+    if (RunSumatraDdeExecute(ddeExecute)) {
         wchar_t status[kMaxStatusChars] = {};
         wsprintfW(status, L"%ls sent to SumatraPDF.", action->label);
         SetStatus(status);
     }
 }
 
+#ifndef PAGEHOTKEYS_PUBLIC_BUILD
 void HandleRawKeyDown(BYTE vk) {
     if (IsModifierVk(vk)) {
         return;
@@ -1098,6 +1730,7 @@ void HandleRawInput(HRAWINPUT rawInputHandle) {
 
     HandleRawKeyDown(vk);
 }
+#endif
 
 bool ApplyCurrentSettings(bool save) {
     ReadUiToConfig();
@@ -1110,6 +1743,17 @@ bool ApplyCurrentSettings(bool save) {
     const RegistrationCounts counts = RegisterAllHotkeys();
 
     if (counts.commandConfigured == 0) {
+#ifdef PAGEHOTKEYS_RPI_UDP
+        if (g_config.rpiEnabled) {
+            if (save && !SaveConfig()) {
+                SetStatusWithErrorPrefix(L"Could not save settings.", GetLastError());
+                return false;
+            }
+            StartRpiController();
+            SetStatus(L"No PDF command hotkeys are configured. RPi UDP can still send commands.");
+            return true;
+        }
+#endif
         SetStatus(L"No PDF command hotkeys are configured.");
         return false;
     }
@@ -1120,6 +1764,7 @@ bool ApplyCurrentSettings(bool save) {
     }
 
     wchar_t status[kMaxStatusChars] = {};
+#ifndef PAGEHOTKEYS_PUBLIC_BUILD
     if (counts.rawFallback) {
         if (save) {
             wsprintfW(
@@ -1132,8 +1777,14 @@ bool ApplyCurrentSettings(bool save) {
                 L"Consume key failed; %d PDF hotkey(s) active non-consuming.",
                 counts.commandRegistered);
         }
-    } else if (counts.failed == 0) {
+    } else
+#endif
+    if (counts.failed == 0) {
+#ifdef PAGEHOTKEYS_PUBLIC_BUILD
+        const wchar_t* modeText = L"consuming";
+#else
         const wchar_t* modeText = counts.rawInputMode ? L"non-consuming" : L"consuming";
+#endif
         if (save) {
             wsprintfW(
                 status,
@@ -1151,15 +1802,32 @@ bool ApplyCurrentSettings(bool save) {
             counts.failed);
     }
     SetStatus(status);
+#ifdef PAGEHOTKEYS_RPI_UDP
+    StartRpiController();
+#endif
+#ifdef PAGEHOTKEYS_PUBLIC_BUILD
+    return counts.failed == 0;
+#else
     return counts.failed == 0 || counts.rawFallback;
+#endif
 }
 
 void RestoreDefaultHotkeys() {
     g_updatingUi = true;
-    g_consumeKey = false;
+    g_consumeKey = kPublicBuild;
+    g_config.scrollLines = kDefaultScrollLines;
+#ifdef PAGEHOTKEYS_RPI_UDP
+    g_config.rpiEnabled = false;
+    g_config.rpiPort = kDefaultRpiPort;
+    CopyString(g_config.rpiToken, CountOf(g_config.rpiToken), L"wojtron");
+#endif
     if (g_consumeKeyCheckbox != nullptr) {
         CheckDlgButton(g_mainWindow, kIdConsumeKey, BST_UNCHECKED);
     }
+    SetScrollLinesUi(g_config.scrollLines);
+#ifdef PAGEHOTKEYS_RPI_UDP
+    SetRpiUiFromConfig();
+#endif
 
     for (size_t i = 0; i < CountOf(g_actions); ++i) {
         g_actions[i].hotkey = g_actions[i].defaultHotkey;
@@ -1363,27 +2031,35 @@ LRESULT CALLBACK InfoWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
                 22,
                 68,
                 500,
-                154,
+                168,
                 window,
                 -1);
             if (body != nullptr && g_infoBodyFont != nullptr) {
                 SendMessageW(body, WM_SETFONT, reinterpret_cast<WPARAM>(g_infoBodyFont), TRUE);
             }
 
-            HWND version = CreateChild(L"STATIC", L"version 0.1.5", SS_CENTER, 0,
-                                       22, 240, 500, 24, window, -1);
+#ifdef PAGEHOTKEYS_PUBLIC_BUILD
+            HWND version = CreateChild(L"STATIC", L"version 0.1.14 public", SS_CENTER, 0,
+                                       22, 254, 500, 24, window, -1);
+#elif defined(PAGEHOTKEYS_RPI_UDP)
+            HWND version = CreateChild(L"STATIC", L"version 0.1.14 rpi", SS_CENTER, 0,
+                                       22, 254, 500, 24, window, -1);
+#else
+            HWND version = CreateChild(L"STATIC", L"version 0.1.14", SS_CENTER, 0,
+                                       22, 254, 500, 24, window, -1);
+#endif
             if (version != nullptr && g_infoBodyFont != nullptr) {
                 SendMessageW(version, WM_SETFONT, reinterpret_cast<WPARAM>(g_infoBodyFont), TRUE);
             }
 
             HWND credit = CreateChild(L"STATIC", L"by wojtron", SS_CENTER, 0,
-                                      22, 266, 500, 26, window, kIdInfoCredit);
+                                      22, 280, 500, 26, window, kIdInfoCredit);
             if (credit != nullptr && g_infoCreditFont != nullptr) {
                 SendMessageW(credit, WM_SETFONT, reinterpret_cast<WPARAM>(g_infoCreditFont), TRUE);
             }
 
             HWND closeButton = CreateChild(L"BUTTON", L"Close", WS_TABSTOP | BS_DEFPUSHBUTTON, 0,
-                                           232, 300, 96, 30, window, IDOK);
+                                           232, 314, 96, 30, window, IDOK);
             if (closeButton != nullptr && g_infoBodyFont != nullptr) {
                 SendMessageW(closeButton, WM_SETFONT, reinterpret_cast<WPARAM>(g_infoBodyFont), TRUE);
             }
@@ -1437,7 +2113,7 @@ void ShowInfoWindow(HWND owner) {
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         560,
-        382,
+        410,
         owner,
         nullptr,
         g_instance,
@@ -1465,6 +2141,7 @@ void CreateMainControls(HWND window) {
 
     CreateChild(L"BUTTON", L"Hotkeys", BS_GROUPBOX, 0,
                 18, 84, 562, 210, window, -1);
+#ifndef PAGEHOTKEYS_PUBLIC_BUILD
     g_consumeKeyCheckbox = CreateChild(
         L"BUTTON",
         L"Consume key",
@@ -1476,6 +2153,37 @@ void CreateMainControls(HWND window) {
         24,
         window,
         kIdConsumeKey);
+#endif
+
+    CreateChild(L"STATIC", L"Scroll lines", 0, 0,
+                455, 154, 110, 20, window, -1);
+    g_scrollLinesEdit = CreateChild(
+        L"EDIT",
+        L"",
+        WS_TABSTOP | WS_BORDER | ES_NUMBER | ES_AUTOHSCROLL,
+        WS_EX_CLIENTEDGE,
+        455,
+        176,
+        110,
+        24,
+        window,
+        kIdScrollLinesEdit);
+    g_scrollLinesSpin = CreateChild(
+        UPDOWN_CLASSW,
+        L"",
+        WS_TABSTOP | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_SETBUDDYINT | UDS_NOTHOUSANDS,
+        0,
+        0,
+        0,
+        0,
+        0,
+        window,
+        kIdScrollLinesSpin);
+    if (g_scrollLinesSpin != nullptr) {
+        SendMessageW(g_scrollLinesSpin, UDM_SETBUDDY, reinterpret_cast<WPARAM>(g_scrollLinesEdit), 0);
+        SendMessageW(g_scrollLinesSpin, UDM_SETRANGE32, kMinScrollLines, kMaxScrollLines);
+        SendMessageW(g_scrollLinesSpin, UDM_SETPOS32, 0, g_config.scrollLines);
+    }
 
     const int checkboxX = 42;
     const int hotkeyX = 220;
@@ -1508,19 +2216,63 @@ void CreateMainControls(HWND window) {
             g_actions[i].controlId);
     }
 
+#ifdef PAGEHOTKEYS_RPI_UDP
+    CreateChild(L"BUTTON", L"RPi UDP controller", BS_GROUPBOX, 0,
+                18, 304, 562, 88, window, -1);
+    g_rpiEnableCheckbox = CreateChild(
+        L"BUTTON",
+        L"Enable",
+        WS_TABSTOP | BS_AUTOCHECKBOX,
+        0,
+        42,
+        332,
+        86,
+        24,
+        window,
+        kIdRpiEnable);
+    CreateChild(L"STATIC", L"Port", 0, 0,
+                144, 334, 42, 20, window, -1);
+    g_rpiPortEdit = CreateChild(
+        L"EDIT",
+        L"",
+        WS_TABSTOP | WS_BORDER | ES_NUMBER | ES_AUTOHSCROLL,
+        WS_EX_CLIENTEDGE,
+        186,
+        330,
+        72,
+        24,
+        window,
+        kIdRpiPortEdit);
+    CreateChild(L"STATIC", L"Token", 0, 0,
+                278, 334, 50, 20, window, -1);
+    g_rpiTokenEdit = CreateChild(
+        L"EDIT",
+        L"",
+        WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
+        WS_EX_CLIENTEDGE,
+        330,
+        330,
+        150,
+        24,
+        window,
+        kIdRpiTokenEdit);
+    g_rpiStatus = CreateChild(L"STATIC", L"RPi UDP: disabled", 0, 0,
+                              42, 362, 510, 20, window, kIdRpiStatus);
+#endif
+
     CreateChild(L"BUTTON", L"Save and apply", WS_TABSTOP | BS_DEFPUSHBUTTON, 0,
-                18, 314, 140, 32, window, kIdSaveApply);
+                18, kActionButtonY, 140, 32, window, kIdSaveApply);
     CreateChild(L"BUTTON", L"Defaults", WS_TABSTOP | BS_PUSHBUTTON, 0,
-                170, 314, 95, 32, window, kIdDefaults);
+                170, kActionButtonY, 95, 32, window, kIdDefaults);
     CreateChild(L"BUTTON", L"Tray", WS_TABSTOP | BS_PUSHBUTTON, 0,
-                277, 314, 105, 32, window, kIdTray);
+                277, kActionButtonY, 105, 32, window, kIdTray);
     CreateChild(L"BUTTON", L"Info", WS_TABSTOP | BS_PUSHBUTTON, 0,
-                394, 314, 79, 32, window, kIdInfo);
+                394, kActionButtonY, 79, 32, window, kIdInfo);
     CreateChild(L"BUTTON", L"Exit", WS_TABSTOP | BS_PUSHBUTTON, 0,
-                485, 314, 95, 32, window, kIdExit);
+                485, kActionButtonY, 95, 32, window, kIdExit);
 
     g_status = CreateChild(L"STATIC", L"", 0, 0,
-                           18, 366, 562, 42, window, kIdStatus);
+                           18, kStatusY, 562, 42, window, kIdStatus);
 }
 
 HotkeyAction* FindActionById(int id) {
@@ -1533,10 +2285,55 @@ HotkeyAction* FindActionById(int id) {
     return nullptr;
 }
 
+#ifdef PAGEHOTKEYS_RPI_UDP
+void HandleRpiControllerMessage(WPARAM event, LPARAM value) {
+    if (event == 1001) {
+        wchar_t text[96] = {};
+        wsprintfW(text, L"RPi UDP: listening on port %ld", static_cast<long>(value));
+        SetRpiStatus(text);
+        return;
+    }
+
+    if (event == 1002) {
+        if (!g_config.rpiEnabled) {
+            SetRpiStatus(L"RPi UDP: disabled");
+        }
+        return;
+    }
+
+    if (event == 1003) {
+        wchar_t text[96] = {};
+        wsprintfW(text, L"RPi UDP: error %ld", static_cast<long>(value));
+        SetRpiStatus(text);
+        return;
+    }
+
+    HotkeyAction* action = FindActionById(static_cast<int>(event));
+    if (action == nullptr || action->quits) {
+        return;
+    }
+
+    FireAction(action);
+    wchar_t text[128] = {};
+    wsprintfW(text, L"RPi UDP: %ls", action->label);
+    SetRpiStatus(text);
+}
+#endif
+
 bool IsSettingsControlChange(int id, int notificationCode) {
+#ifndef PAGEHOTKEYS_PUBLIC_BUILD
     if (id == kIdConsumeKey && notificationCode == BN_CLICKED) {
         return true;
     }
+#endif
+#ifdef PAGEHOTKEYS_RPI_UDP
+    if (id == kIdRpiEnable && notificationCode == BN_CLICKED) {
+        return true;
+    }
+    if ((id == kIdRpiPortEdit || id == kIdRpiTokenEdit) && notificationCode == EN_CHANGE) {
+        return true;
+    }
+#endif
 
     for (size_t i = 0; i < CountOf(g_actions); ++i) {
         if (id == g_actions[i].enableControlId && notificationCode == BN_CLICKED) {
@@ -1600,9 +2397,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             return 0;
         }
 
+#ifndef PAGEHOTKEYS_PUBLIC_BUILD
         case WM_INPUT:
             HandleRawInput(reinterpret_cast<HRAWINPUT>(lParam));
             return 0;
+#endif
 
         case kTrayCallbackMessage:
             if (lParam == WM_LBUTTONUP ||
@@ -1612,11 +2411,20 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             }
             return 0;
 
+#ifdef PAGEHOTKEYS_RPI_UDP
+        case kRpiControllerMessage:
+            HandleRpiControllerMessage(wParam, lParam);
+            return 0;
+#endif
+
         case WM_CLOSE:
             DestroyWindow(window);
             return 0;
 
         case WM_DESTROY:
+#ifdef PAGEHOTKEYS_RPI_UDP
+            StopRpiController();
+#endif
             RemoveTrayIcon(window);
             UnregisterAllHotkeys();
             if (g_infoTitleFont != nullptr) {
@@ -1674,7 +2482,7 @@ int WINAPI wWinMain(HINSTANCE instance,
 
     INITCOMMONCONTROLSEX commonControls = {};
     commonControls.dwSize = sizeof(commonControls);
-    commonControls.dwICC = ICC_HOTKEY_CLASS;
+    commonControls.dwICC = ICC_HOTKEY_CLASS | ICC_UPDOWN_CLASS;
     InitCommonControlsEx(&commonControls);
 
     if (!RegisterMainWindowClass()) {
@@ -1695,7 +2503,7 @@ int WINAPI wWinMain(HINSTANCE instance,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         616,
-        458,
+        kMainWindowHeight,
         nullptr,
         nullptr,
         instance,
